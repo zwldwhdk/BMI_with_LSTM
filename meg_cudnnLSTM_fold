@@ -1,0 +1,232 @@
+from __future__ import absolute_import, division, print_function
+import sys
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+from tensorflow import flags
+
+tf.random.set_random_seed(777)  # reproducibility
+
+# parameter flags
+flags.DEFINE_float('learning_rate',     0.001, 'Eta')
+flags.DEFINE_integer('epoches',         70,    'training epoches')
+flags.DEFINE_integer('batch_size',      1551,  'step x time')
+flags.DEFINE_integer('input_dim',       204,    'Gradiometer 68 channels')
+flags.DEFINE_integer('sequence_length', 11,    'sampling steps, 141')
+flags.DEFINE_integer('time_step',       141,   'time setps, 11')
+flags.DEFINE_integer('hidden_size',     204,    'size of input layer')
+flags.DEFINE_integer('output_dim',      3,     '3D Axis, [X, Y, Z]')
+FLAGS = flags.FLAGS
+
+# Error code defence; UnrecognizedFlagError: Unknown command line flag 'f'
+# The error might be modified in upper version update...
+remaining_args = FLAGS([sys.argv[0]] + [flag for flag in sys.argv if flag.startswith("--")])
+assert(remaining_args == [sys.argv[0]])
+
+# Hyper parameters and constants
+learning_rate   = FLAGS.learning_rate
+epoch           = FLAGS.epoches
+batch_size      = FLAGS.batch_size
+input_dim       = FLAGS.input_dim
+sequence_length = FLAGS.sequence_length
+time_steps      = FLAGS.time_step
+hidden_size     = FLAGS.hidden_size
+output_dim      = FLAGS.output_dim
+
+
+class LSTM():
+    def __init__(self, sess, name):
+        self.sess = sess
+        self.name = name
+        self._BD_LSTM()
+
+    def _BD_LSTM(self):
+        with tf.variable_scope(self.name, reuse=tf.AUTO_REUSE):
+
+            # Set placeholders
+            self.X        = tf.placeholder(tf.float32, [None, input_dim])
+            X_reshape     = tf.reshape(self.X, [-1, sequence_length, input_dim])  # split for RNN
+            X_transpose   = tf.transpose(X_reshape, [1, 0, 2])
+
+            # [Sequence_length, batch_size, input_dim]
+            self.Y        = tf.placeholder(tf.float32, [None, output_dim])  # [time steps x Axis]
+            self.training = tf.placeholder(tf.float32)
+
+            # Bidirectional Layer Norm LSTM cells
+            fw_cell = tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell(
+                num_units=hidden_size,
+            )
+            #fw_cell = fw_cell.zero_state(batch_size=sequence_length, dtype=tf.float32)
+            #fw_cell = tf.nn.rnn_cell.DropoutWrapper(cell=fw_cell, output_keep_prob=self.training)
+
+            bw_cell = tf.contrib.cudnn_rnn.CudnnCompatibleLSTMCell(
+                num_units=hidden_size
+            )
+            #bw_cell = bw_cell.zero_state(batch_size=sequence_length, dtype=tf.float32)
+            #bw_cell = tf.nn.rnn_cell.DropoutWrapper(cell=bw_cell, output_keep_prob=self.training)
+
+            outputs, _state = tf.nn.bidirectional_dynamic_rnn(inputs=X_transpose,
+                                                              cell_fw=fw_cell, cell_bw=bw_cell,
+                                                              dtype=tf.float32)
+
+
+            # Concate LSTM layer results in row; Reduce dimension
+            fw_output = outputs[0]
+            bw_output = outputs[1]
+            self.output    = tf.concat([fw_output[-1], bw_output[-1]], axis=1)  # (time step, 204*2)
+
+            # LSTM output normalization
+            # mean, var = tf.nn.moments(output, axes=[0])
+            # output    = (output - mean) / tf.sqrt(var)
+
+            # Dense Layer
+            W = tf.get_variable(name='dense_weight',
+                                shape=[hidden_size * 2, output_dim], dtype=tf.float32,
+                                initializer=tf.contrib.layers.xavier_initializer(),
+                                regularizer=tf.contrib.layers.l2_regularizer(scale=0.1))
+            b = tf.get_variable(name='dense_bias',
+                                shape=[output_dim], dtype=tf.float32,
+                                initializer=tf.contrib.layers.xavier_initializer(),
+                                regularizer=tf.contrib.layers.l2_regularizer(scale=0.1))
+
+            self.hypothesis = tf.matmul(self.output, W) + b  # (time step, axis)
+
+            # Loss function: Linear regression, MSE
+            self.loss       = tf.reduce_mean(tf.square(self.Y - self.hypothesis))
+            # Optimizer: Adam Optimizer
+            self.optimizer  = \
+                tf.train.AdamOptimizer(learning_rate=learning_rate).minimize(self.loss)
+
+    def loss_function(self, train_x, train_y, keep_prob):
+        return self.sess.run([self.loss, self.optimizer],
+                             feed_dict={self.X: train_x, self.Y: train_y,
+                                        self.training: keep_prob})
+
+    def correlation(self, test_x, test_y, keep_prob):
+        hypothesis, Y = self.sess.run([self.hypothesis, self.Y],
+                                      feed_dict={self.X: test_x, self.Y: test_y,
+                                                 self.training: keep_prob})
+        pred = hypothesis - np.mean(hypothesis, axis=0)
+        real = Y - np.mean(Y, axis=0)
+        pearson_a = np.sum(pred * real, axis=0)
+        pearson_b = np.sqrt((np.sum(np.square(pred), axis=0)
+                             * np.sum(np.square(real), axis=0)))
+        correlation = pearson_a / pearson_b
+        coefficient = np.square(correlation)
+        return correlation, coefficient
+
+    def prediction(self, test_x, test_y, keep_prob):
+        return self.sess.run(self.hypothesis,
+                             feed_dict={self.X: test_x, self.Y: test_y,
+                                        self.training: keep_prob})
+    def lstm_output(self, test_x, test_y, keep_prob):
+        return self.sess.run(self.output,
+                             feed_dict={self.X: test_x, self.Y: test_y, self.training: keep_prob})
+
+def train(train, save_path):
+
+    # Making batch iterator
+    iterator     = tf.data.Iterator.from_structure(train.output_types, train.output_shapes)
+    next_element = iterator.get_next()
+    init_train   = iterator.make_initializer(train)
+
+    with tf.Session() as sess:
+
+        num_models  = 5
+
+        lstm_models = [LSTM(sess=sess, name='bd_LSTM_model_'+str(i)) for i in range(num_models)]
+
+        sess.run(tf.global_variables_initializer())
+        sess.run(tf.local_variables_initializer())
+
+        loss_summery = []
+        print('$ Learning STARTED!')
+        start = time.time()
+
+        for e in range(epoch):
+            sess.run(init_train)
+            init          = time.time()
+            avg_loss_list = np.zeros(len(lstm_models))
+            step          = 1  # Iterator counter
+
+            while step * batch_size < (batch_size * 192) + 1:
+                batch_x, batch_y = sess.run([next_element["X"], next_element['Y']])
+
+                #loss, _opt = [model.loss_function(batch_x, batch_y, keep_prob=0.7) for idx, model in enumerate(lstm_models)]
+                for idx, model in enumerate(lstm_models):
+                    loss, _opt          = model.loss_function(batch_x, batch_y, 0.7)
+                    avg_loss_list[idx] += loss / 192
+
+                step += 1
+
+            # time_checker
+            off        = time.time()
+            check      = off - init
+            epoch_loss = np.round(np.mean(avg_loss_list), 5)
+            loss_summery.append(epoch_loss)  # for plotting loss functions
+
+            print('-------------------------------------------------------------------------')
+            print('$ [{}]'.format(e + 1), 'LOSS[{}]:'.format(epoch_loss), np.round(avg_loss_list, 5))
+            print('$time lapse: {}min, {}sec'.format(int((check // 60)),
+                                                     np.round((check % 60), 1)))
+
+        print('=========================================================================')
+        saver = tf.train.Saver()
+        saver.save(sess=sess, save_path=save_path)
+        print("$ SAVE TO", save_path)
+        print('$ LEARNING FINISHED... READY FOR TESTING')
+
+        # Whole Time checkup;
+        end = time.time()
+        lapse = end - start
+        print('$TOTAL TIME: {}hour {}min {}sec'.format(int((lapse//3600)), int((lapse%3600)//60), np.round((lapse%3600)%60,1)))
+        sess.close()
+
+
+
+# train iterator
+from meg_data_load import Load_datasets
+
+for f in range(3, 4, 2):
+    data_no     = f
+    cd          = 'C:/Users/scarecrow/Desktop/MEG'
+    file_name   = 'MEG' + str(input_dim)
+    sensor_no   = 0
+    sensor_list = {0: 'acc', 1: "vel", 2: 'loc'}
+    subj_no = int((f + 1) / 2)
+
+    X_data, Y_data = Load_datasets(cd=cd,
+                                   file_name=file_name,
+                                   file_no=data_no,
+                                   sensor=sensor_no)
+
+    # Reshaping [Full trials, batch size, channels]; [Full trials, time step, axis]
+    X_data = np.reshape(X_data, [-1, batch_size, input_dim])
+    Y_data = np.reshape(Y_data, [-1, time_steps, output_dim])
+
+    for s in range(0, 5):
+        fold = s*48
+        # 5-fold training
+        if fold == 0: # s = 0
+            # Tensof slicing for batch iterator
+            trainset = tf.data.Dataset.from_tensor_slices(
+                {'X': X_data[fold+48:, :, :],
+                 'Y': Y_data[fold+48:, :, :]})
+        elif fold == 192: # s = 4
+            trainset = tf.data.Dataset.from_tensor_slices(
+                {'X': X_data[:fold, :, :],
+                 'Y': Y_data[:fold, :, :]})
+        else : # s = 1, 2, 3
+            trainset = tf.data.Dataset.from_tensor_slices(
+                {'X': tf.concat([X_data[:fold, :, :], X_data[fold+48:, :, :]], axis=0),
+                 'Y': tf.concat([Y_data[:fold, :, :], Y_data[fold+48:, :, :]], axis=0)})
+        print('$ Get tensor shape(train):\n', trainset)
+        print('=========================================================================\n')
+
+        save_path = 'E:/save_path2/LSTM/{}/subj{}/'.format(sensor_list[sensor_no], subj_no)+\
+                    file_name+\
+                    'cudnnLSTM_{}_sbj{}_fold{}'.format(sensor_list[sensor_no], subj_no, s+1)
+        #fig_name  = './loss_MEG{}_cudnLSTM_{}_sbj{}'.format(input_dim, sensor_list[sensor_no], int((f + 1) / 2))
+        # START TRAINING
+        train(train=trainset, save_path=save_path)
