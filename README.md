@@ -21,4 +21,5 @@ Non-invasive Brain signal data; especially EEG or MEG For this cords, I used 306
 
 
 **ALL the codes are built with Tensorflow 
+
 2019.05.07, ALL the code will be reconstructed with 'Keras' with tensorflow
