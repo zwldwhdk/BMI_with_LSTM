@@ -18,3 +18,7 @@ Non-invasive Brain signal data; especially EEG or MEG For this cords, I used 306
 1) single-layered bidirectional Long-Short Term Memory(bLSTM)
 2) 3 layered Convolution Neural Network
 3) RCNN; 3-layered CNN + single-layer bLSTM
+
+
+**ALL the codes are built with Tensorflow 
+2019.05.07, ALL the code will be reconstructed with 'Keras' with tensorflow
